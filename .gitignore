@@ -1,0 +1,21 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Environment & Secrets
+.env
+*wallet*.json
+*.keypair
+*.key
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

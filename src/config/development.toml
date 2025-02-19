@@ -1,0 +1,19 @@
+[environment]
+type = "Development"
+
+[network]
+rpc_url = "https://mainnet.helius-rpc.com/?api-key=473e3aa2-9e94-4578-8d01-dc23008a09c0"
+ws_url = "wss://mainnet.helius-rpc.com/?api-key=473e3aa2-9e94-4578-8d01-dc23008a09c0"
+
+[programs]
+main_program = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"  # pump.fun
+pool_contract = "24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHDS2SG3LYwBpyTi"  # meteora
+
+[execution]
+purchase_amount = 250000000    # 0.25 SOL
+jito_tip = 10000000           # 0.01 SOL
+slippage_percentage = 2.0
+
+[wallet]
+keypair_path = "dev_wallet.json"  # Path to your dev wallet file
+min_sol_balance = 1000000000  # 1 SOL
