@@ -1,5 +1,5 @@
 [environment]
-type = "Development"
+environment = "Development"
 
 [network]
 rpc_url = "https://mainnet.helius-rpc.com/?api-key=473e3aa2-9e94-4578-8d01-dc23008a09c0"

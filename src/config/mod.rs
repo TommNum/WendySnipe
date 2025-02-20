@@ -5,42 +5,47 @@ use tracing::{info, error};
 use solana_sdk::signature::{Keypair, Signer};
 use solana_client::rpc_client::RpcClient;
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub struct Config {
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+pub enum Environment {
+    Development,
+    Production,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnvironmentConfig {
     pub environment: Environment,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Config {
+    pub environment: EnvironmentConfig,
     pub network: Network,
     pub programs: Programs,
     pub execution: Execution,
     pub wallet: WalletConfig,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Environment {
-    #[serde(rename = "type")]
-    pub env_type: String,
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Network {
     pub rpc_url: String,
     pub ws_url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Programs {
     pub main_program: String,
     pub pool_contract: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Execution {
     pub purchase_amount: u64,
     pub jito_tip: u64,
     pub slippage_percentage: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct WalletConfig {
     pub keypair_path: String,
     pub min_sol_balance: u64,

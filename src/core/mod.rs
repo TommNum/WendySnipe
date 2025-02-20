@@ -1,25 +1,24 @@
-// src/core/mod.rs
 use crate::config::Config;
 use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::pubkey::Pubkey;
 use solana_client::rpc_client::RpcClient;
 use anyhow::Result;
-use tracing::{info, error};
-use std::sync::Arc;
+use tracing::{info, error, warn};
 
 mod websocket;
-use self::websocket::WebsocketMonitor;
+pub use websocket::{WebsocketMonitor, PoolType};
 
 pub struct PoolMonitor {
     config: Config,
     wallet: Keypair,
-    rpc_client: Arc<RpcClient>,
+    rpc_client: RpcClient,
     websocket_monitor: WebsocketMonitor,
 }
 
 impl PoolMonitor {
-    pub fn new(config: crate::config::Config, wallet: Keypair) -> Result<Self> {
-        let rpc_client = Arc::new(RpcClient::new(&config.network.rpc_url));
-        let websocket_monitor = WebsocketMonitor::new(&config.network.ws_url, Arc::clone(&rpc_client))?;
+    pub fn new(config: Config, wallet: Keypair) -> Result<Self> {
+        let rpc_client = RpcClient::new(&config.network.rpc_url);
+        let websocket_monitor = WebsocketMonitor::new(&config.network.ws_url, &config)?;
         
         Ok(Self {
             config,

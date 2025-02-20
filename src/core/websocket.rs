@@ -1,73 +1,73 @@
-use tokio_tungstenite::connect_async;
-use futures::{StreamExt, SinkExt};
-use serde_json::{json, Value};
-use anyhow::{Result, anyhow};
-use dashmap::DashMap;
-use tracing::{info, error, warn, debug};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicI64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use solana_client::rpc_client::RpcClient;
-use solana_client::rpc_request::TokenAccountsFilter;
-use solana_sdk::program_pack::Pack;
-use spl_token::state::Account as TokenAccount;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use solana_account_decoder::UiAccountData;
-use tokio::sync::mpsc;
+use {
+    anyhow::{Result, anyhow},
+    futures::{SinkExt, StreamExt},
+    serde_json::{json, Value},
+    std::collections::HashMap,
+    tokio_tungstenite::{connect_async, WebSocketStream},
+    tracing::{info, error, warn, debug},
+    chrono::Utc,
+    solana_sdk::pubkey::Pubkey,
+    crate::config::{Config, Environment},
+};
+
+#[derive(Debug, Clone)]
+pub enum PoolType {
+    PumpFun,  // Development
+    DaoFun    // Production
+}
+
+#[derive(Debug)]
+pub struct PoolCreationEvent {
+    pub signature: String,
+    pub pool_address: Pubkey,
+    pub token_address: Pubkey,
+    pub holder_count: u64,
+    pub buy_count: u64,
+    pub timestamp: i64,
+    pub slot: u64,
+    pub pool_type: PoolType,
+}
+
+#[derive(Debug)]
+pub struct PumpFunCriteria {
+    pub holder_count: u64,
+    pub buy_count: u64,
+    min_holders: u64,
+    min_buys: u64,
+    max_buys: u64,
+}
+
+impl Default for PumpFunCriteria {
+    fn default() -> Self {
+        Self {
+            holder_count: 0,
+            buy_count: 0,
+            min_holders: 140,
+            min_buys: 140,
+            max_buys: 300,
+        }
+    }
+}
 
 pub struct WebsocketMonitor {
     ws_url: String,
-    token_holders_cache: Arc<DashMap<String, u64>>,
-    rpc_client: Arc<RpcClient>,
-    reconnect_attempts: AtomicU32,
-    last_connection_time: AtomicI64,
+    config: Config,
+    token_metrics: HashMap<String, PumpFunCriteria>,
 }
 
 impl WebsocketMonitor {
-    pub fn new(ws_url: &str, rpc_client: Arc<RpcClient>) -> Result<Self> {
+    pub fn new(ws_url: &str, config: &Config) -> Result<Self> {
         Ok(Self {
             ws_url: ws_url.to_string(),
-            token_holders_cache: Arc::new(DashMap::new()),
-            rpc_client,
-            reconnect_attempts: AtomicU32::new(0),
-            last_connection_time: AtomicI64::new(0),
+            config: config.clone(),
+            token_metrics: HashMap::new(),
         })
     }
 
     pub async fn subscribe_to_logs(&self) -> Result<()> {
-        loop {
-            match self.connect_and_monitor().await {
-                Ok(_) => {
-                    info!("WebSocket connection closed gracefully");
-                    self.reconnect_attempts.store(0, Ordering::SeqCst);
-                }
-                Err(e) => {
-                    let attempts = self.reconnect_attempts.fetch_add(1, Ordering::SeqCst);
-                    error!("WebSocket error (attempt {}): {}", attempts + 1, e);
-                    
-                    if attempts >= 5 {
-                        return Err(anyhow!("Max reconnection attempts reached"));
-                    }
-                    
-                    let delay = 5000 * (attempts as u64 + 1);
-                    warn!("Reconnecting in {} ms...", delay);
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                }
-            }
-        }
-    }
-
-    async fn connect_and_monitor(&self) -> Result<()> {
         info!("Connecting to websocket...");
         
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        self.last_connection_time.store(now, Ordering::SeqCst);
-
         let (ws_stream, _) = connect_async(&self.ws_url).await?;
-        let (write, mut read) = ws_stream.split();
         info!("WebSocket connected successfully");
 
         let subscribe_msg = json!({
@@ -77,156 +77,186 @@ impl WebsocketMonitor {
             "params": [
                 {
                     "mentions": [
-                        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-                        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+                        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // pump.fun
+                        "5jnapfrAN47UYkLkEf7HnprPPBCQLvkYWGZDeKkaP5hv", // dao.fun
+                        "CreateIdempotent"
                     ]
                 },
                 {"commitment": "processed"}
             ]
         });
 
-        // Create channel for ping task to communicate with write half
-        let (tx, mut rx) = mpsc::channel(32);
-        let mut write = write;
+        self.process_logs(ws_stream, subscribe_msg).await
+    }
 
-        // Send initial subscription
-        write.send(tokio_tungstenite::tungstenite::Message::Text(subscribe_msg.to_string())).await?;
-
-        // Spawn heartbeat task
-        let ping_tx = tx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                if ping_tx.send(tokio_tungstenite::tungstenite::Message::Ping(vec![])).await.is_err() {
-                    error!("Failed to send ping message");
-                    break;
-                }
-                debug!("Ping sent");
-            }
-        });
-
-        // Spawn writer task
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                if let Err(e) = write.send(msg).await {
-                    error!("Failed to send websocket message: {}", e);
-                    break;
-                }
-            }
-        });
-
-        // Handle incoming messages
-        while let Some(msg) = read.next().await {
+    async fn process_logs(&self, mut ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, subscribe_msg: Value) -> Result<()> {
+        ws_stream.send(tokio_tungstenite::tungstenite::Message::Text(subscribe_msg.to_string())).await?;
+        
+        while let Some(msg) = ws_stream.next().await {
             match msg {
                 Ok(msg) => {
-                    match msg {
-                        tokio_tungstenite::tungstenite::Message::Pong(_) => {
-                            debug!("Received pong");
-                            continue;
-                        }
-                        tokio_tungstenite::tungstenite::Message::Close(_) => {
-                            info!("Received close frame");
-                            break;
-                        }
-                        tokio_tungstenite::tungstenite::Message::Text(text) => {
-                            if let Ok(log_data) = serde_json::from_str::<Value>(&text) {
-                                if self.is_valid_pool_creation(&log_data) {
-                                    if let Ok(token_address) = self.extract_token_address(&log_data) {
-                                        if let Ok(holder_count) = self.get_holder_count(&token_address).await {
-                                            info!("Valid pool creation detected with {} holders", holder_count);
-                                            // TODO: Trigger buy transaction
-                                        }
-                                    }
+                    if let Ok(log_data) = serde_json::from_str::<Value>(&msg.to_string()) {
+                        if let Some(pool_type) = self.is_create_idempotent(&log_data) {
+                            match (pool_type, &self.config.environment.environment) {
+                                (PoolType::PumpFun, Environment::Development) => {
+                                    info!("Detected pump.fun pool creation in development");
+                                    self.handle_pump_fun_creation(&log_data).await?;
+                                },
+                                (PoolType::DaoFun, Environment::Production) => {
+                                    info!("Detected dao.fun pool creation in production");
+                                    self.handle_dao_fun_creation(&log_data).await?;
+                                },
+                                _ => {
+                                    debug!("Ignoring pool creation - environment mismatch");
                                 }
                             }
                         }
-                        _ => continue,
                     }
                 }
                 Err(e) => {
-                    error!("WebSocket message error: {}", e);
-                    return Err(anyhow!("WebSocket message error: {}", e));
+                    error!("WebSocket message error: {:?}", e);
+                    return Err(anyhow!("WebSocket error: {:?}", e));
                 }
             }
         }
-
         Ok(())
     }
 
-    fn is_valid_pool_creation(&self, _log_data: &Value) -> bool {
-        // TODO: Implement actual pool creation detection logic
-        false
-    }
-
-    fn extract_token_address(&self, _log_data: &Value) -> Result<String> {
-        // TODO: Implement token address extraction logic
-        Err(anyhow!("Not implemented"))
-    }
-
-    async fn get_holder_count(&self, token_address: &str) -> Result<u64> {
-        if let Some(count) = self.token_holders_cache.get(token_address) {
-            return Ok(*count);
-        }
-
-        let mut total_holders = 0;
-
-        // Check regular SPL Token accounts
-        if let Ok(accounts) = self.rpc_client.get_token_accounts_by_owner_with_commitment(
-            &token_address.parse()?,
-            TokenAccountsFilter::Mint(token_address.parse()?),
-            self.rpc_client.commitment(),
-        ) {
-            total_holders += accounts.value.iter()
-                .filter(|account| {
-                    match &account.account.data {
-                        UiAccountData::Binary(data, _) => {
-                            if let Ok(decoded) = BASE64.decode(data) {
-                                if let Ok(token_account) = TokenAccount::unpack(&decoded) {
-                                    token_account.amount > 0
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
+    fn is_create_idempotent(&self, log_data: &Value) -> Option<PoolType> {
+        if let Some(logs) = log_data.get("result").and_then(|r| r.get("logs")) {
+            logs.as_array().map_or(None, |log_array| {
+                for log in log_array {
+                    if let Some(log_str) = log.as_str() {
+                        if log_str.contains("CreateIdempotent") {
+                            if log_str.contains("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") {
+                                return Some(PoolType::PumpFun);
                             }
-                        },
-                        _ => false
-                    }
-                })
-                .count();
-        }
-
-        // Check Token-2022 accounts
-        if let Ok(accounts_2022) = self.rpc_client.get_token_accounts_by_owner_with_commitment(
-            &token_address.parse()?,
-            TokenAccountsFilter::ProgramId("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb".parse()?),
-            self.rpc_client.commitment(),
-        ) {
-            total_holders += accounts_2022.value.iter()
-                .filter(|account| {
-                    match &account.account.data {
-                        UiAccountData::Binary(data, _) => {
-                            if let Ok(decoded) = BASE64.decode(data) {
-                                if let Ok(token_account) = TokenAccount::unpack(&decoded) {
-                                    token_account.amount > 0
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
+                            if log_str.contains("5jnapfrAN47UYkLkEf7HnprPPBCQLvkYWGZDeKkaP5hv") {
+                                return Some(PoolType::DaoFun);
                             }
-                        },
-                        _ => false
+                        }
                     }
-                })
-                .count();
+                }
+                None
+            })
+        } else {
+            None
         }
-
-        let total_holders = total_holders as u64;
-        self.token_holders_cache.insert(token_address.to_string(), total_holders);
-        
-        info!("Token {} has {} total holders (SPL + Token-2022)", token_address, total_holders);
-        Ok(total_holders)
     }
-} 
+
+    async fn handle_pump_fun_creation(&self, log_data: &Value) -> Result<()> {
+        if let Some(event) = self.extract_pool_creation_event(&log_data, PoolType::PumpFun).await? {
+            let criteria = self.verify_pump_fun_criteria(&event.token_address).await?;
+            
+            self.log_criteria_check(&event.token_address, &criteria);
+            
+            if self.is_valid_pump_fun_criteria(&criteria) {
+                info!("Valid pump.fun pool creation detected");
+                self.handle_valid_pool_creation(event).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_dao_fun_creation(&self, log_data: &Value) -> Result<()> {
+        if let Some(event) = self.extract_pool_creation_event(&log_data, PoolType::DaoFun).await? {
+            info!("Valid dao.fun pool creation detected: {}", event.token_address);
+            self.handle_valid_pool_creation(event).await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_pump_fun_criteria(&self, token_address: &Pubkey) -> Result<PumpFunCriteria> {
+        let holder_count = self.get_holder_count(token_address).await?;
+        let buy_count = self.get_buy_count(token_address).await?;
+
+        Ok(PumpFunCriteria {
+            holder_count,
+            buy_count,
+            ..Default::default()
+        })
+    }
+
+    fn is_valid_pump_fun_criteria(&self, criteria: &PumpFunCriteria) -> bool {
+        criteria.holder_count >= criteria.min_holders && 
+        criteria.buy_count >= criteria.min_buys && 
+        criteria.buy_count <= criteria.max_buys
+    }
+
+    fn log_criteria_check(&self, token_address: &Pubkey, criteria: &PumpFunCriteria) {
+        let holder_check = criteria.holder_count >= criteria.min_holders;
+        let buy_check = criteria.buy_count >= criteria.min_buys && criteria.buy_count <= criteria.max_buys;
+
+        info!("Token {} validation:
+            Holders: {} (min: {}) - {}, 
+            Buys: {} (min: {}, max: {}) - {}",
+            token_address,
+            criteria.holder_count,
+            criteria.min_holders,
+            if holder_check { "✅" } else { "❌" },
+            criteria.buy_count,
+            criteria.min_buys,
+            criteria.max_buys,
+            if buy_check { "✅" } else { "❌" }
+        );
+
+        if !holder_check || !buy_check {
+            warn!("Pool creation ignored for token {}: 
+                Insufficient holders ({} < {}) or 
+                Invalid buy count ({} not between {} and {})",
+                token_address,
+                criteria.holder_count,
+                criteria.min_holders,
+                criteria.buy_count,
+                criteria.min_buys,
+                criteria.max_buys
+            );
+        }
+    }
+
+    async fn extract_pool_creation_event(&self, log_data: &Value, pool_type: PoolType) -> Result<Option<PoolCreationEvent>> {
+        // Extract signature
+        let signature = log_data.get("result")
+            .and_then(|r| r.get("signature"))
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| anyhow!("Missing signature"))?
+            .to_string();
+
+        // Extract other fields (simplified for example)
+        let pool_address = Pubkey::new_unique(); // TODO: Extract from logs
+        let token_address = Pubkey::new_unique(); // TODO: Extract from logs
+        let slot = log_data.get("result")
+            .and_then(|r| r.get("slot"))
+            .and_then(|s| s.as_u64())
+            .ok_or_else(|| anyhow!("Missing slot"))?;
+
+        let timestamp = chrono::Utc::now().timestamp();
+
+        Ok(Some(PoolCreationEvent {
+            signature,
+            pool_address,
+            token_address,
+            holder_count: 0,
+            buy_count: 0,
+            timestamp,
+            slot,
+            pool_type,
+        }))
+    }
+
+    async fn get_holder_count(&self, _token_address: &Pubkey) -> Result<u64> {
+        // TODO: Implement actual API call to get holder count
+        Ok(150) // Placeholder
+    }
+
+    async fn get_buy_count(&self, _token_address: &Pubkey) -> Result<u64> {
+        // TODO: Implement actual API call to get buy count
+        Ok(200) // Placeholder
+    }
+
+    async fn handle_valid_pool_creation(&self, event: PoolCreationEvent) -> Result<()> {
+        info!("Processing valid pool creation: {:?}", event);
+        // TODO: Implement transaction execution
+        Ok(())
+    }
+}
